@@ -1,0 +1,56 @@
+# ---- STEP 1: Confirm key columns exist (column-level check only) ----
+required_left  = ["accountid", "customerid"]
+required_right = ["externalaccount_p", "custid_p"]
+
+missing_left  = [c for c in required_left if c not in df_cards.columns]
+missing_right = [c for c in required_right if c not in df_pref.columns]
+
+if missing_left or missing_right:
+    logging.warning(
+        "Preference join skipped — missing columns. left missing=%s right missing=%s",
+        missing_left, missing_right
+    )
+    df_cards_dec_pref = df_cards.copy()
+    df_cards_dec_pref["dec_tm_ge_pref_tm"] = "N"
+else:
+    # ---- STEP 2: Perform join even if values are NULL ----
+    left_acc = "accountid"
+    left_cust = "customerid"
+    right_acc = "externalaccount_p"
+    right_cust = "custid_p"
+
+    logging.info("Join keys (columns) -> left=(%s,%s) right=(%s,%s)",
+                 left_acc, left_cust, right_acc, right_cust)
+
+    # ---- DO NOT CLEAN blanks to NaN before join ----
+    # We join even if keys contain NULLs, matching SAS left-join behavior
+
+    # Convert to string for consistent matching (NULL stays NULL)
+    for df, col in [(df_cards, left_acc), (df_cards, left_cust),
+                    (df_pref, right_acc), (df_pref, right_cust)]:
+        if col in df.columns:
+            df[col] = df[col].astype(str)
+
+    # ---- STEP 3: Safe left join ----
+    df_join = pd.merge(
+        df_cards,
+        df_pref,
+        how="left",
+        left_on=[left_acc, left_cust],
+        right_on=[right_acc, right_cust],
+        suffixes=("", "_p"),
+    )
+
+    # ---- STEP 4: dec_tm_ge_pref_tm ----
+    if "eventtimestamp" in df_join.columns and "eventtimestamp_p" in df_join.columns:
+        df_join["dec_tm_ge_pref_tm"] = (
+            df_join["eventtimestamp"] > df_join["eventtimestamp_p"]
+        ).map({True: "Y", False: "N"}).fillna("N")
+    else:
+        df_join["dec_tm_ge_pref_tm"] = "N"
+
+    # ---- STEP 5: dedup ----
+    if "decisionid" in df_join.columns:
+        df_cards_dec_pref = df_join.drop_duplicates(subset=["decisionid"], keep="first")
+    else:
+        df_cards_dec_pref = df_join
