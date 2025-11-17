@@ -1,0 +1,86 @@
+# ---------- SAS-TRUE WEEKLY SUMMARY (3 rows total) ----------
+
+def _snapdate(d):
+    if pd.isna(d): return pd.NaT
+    d = pd.to_datetime(d).date()
+    weekday = d.weekday()  # Wed = 2
+    return d + timedelta(days=(2 - weekday) % 7)
+
+df_final["SnapDate"] = df_final["decision_date"].apply(_snapdate)
+df_final["DateCompleted"] = report_dt
+
+# ---------- ACCURACY ----------
+accuracy_df = (
+    sample_df
+    .assign(
+        ControlRisk="Accuracy",
+        TestType="Sample",
+        RDE="Alert010_Accuracy_Available_Credit",
+        CommentCode=lambda d: np.where(
+            d["threshold_limit_check"] == "Y", "COM16", "COM19"
+        ),
+    )
+    .groupby(["ControlRisk","TestType","RDE","CommentCode"], dropna=False)
+    .agg(
+        Volume=("decisionid","count"),
+        bal=("alertamount","sum"),
+        Amount=("thresholdamount","sum"),
+    )
+    .reset_index()
+)
+
+# ---------- TIMELINESS ----------
+timeliness_df = (
+    df_final
+    .assign(
+        ControlRisk="Timeliness",
+        TestType="Anomaly",
+        RDE="Alert011_Timeliness_SLA",
+        CommentCode=lambda d: np.where(d["sla_ind"] == "Y","COM16","COM19"),
+    )
+    .groupby(["ControlRisk","TestType","RDE","CommentCode"], dropna=False)
+    .agg(
+        Volume=("decisionid","count"),
+        bal=("alertamount","sum"),
+        Amount=("thresholdamount","sum"),
+    )
+    .reset_index()
+)
+
+# ---------- COMPLETENESS ----------
+completeness_df = (
+    df_final
+    .assign(
+        ControlRisk="Completeness",
+        TestType="Reconciliation",
+        RDE="Alert012_Completeness_All_Clients",
+        CommentCode=lambda d: np.where(
+            d["decisionid_a"].notna(), "COM16", "COM19"
+        ),
+    )
+    .groupby(["ControlRisk","TestType","RDE","CommentCode"], dropna=False)
+    .agg(
+        Volume=("decisionid","count"),
+        bal=("alertamount","sum"),
+        Amount=("thresholdamount","sum"),
+    )
+    .reset_index()
+)
+
+# ---------- CONCAT (total = 3 rows) ----------
+alert_cards_ac_week = pd.concat(
+    [accuracy_df, timeliness_df, completeness_df],
+    ignore_index=True
+)
+
+# ---------- Add SAS fixed columns ----------
+alert_cards_ac_week["RegulatoryName"] = "C86"
+alert_cards_ac_week["LOB"] = "Credit Cards"
+alert_cards_ac_week["ReportName"] = "Credit Cards C86 Alerts"
+alert_cards_ac_week["TestPeriod"] = "Portfolio"
+alert_cards_ac_week["ProductType"] = "Credit Cards"
+alert_cards_ac_week["SnapDate"] = report_dt
+alert_cards_ac_week["DateCompleted"] = report_dt
+alert_cards_ac_week["Segment"] = "."
+alert_cards_ac_week["HoldoutFlag"] = "N"
+alert_cards_ac_week["Comments"] = "Pass"
