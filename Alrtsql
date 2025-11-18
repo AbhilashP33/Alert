@@ -1,0 +1,163 @@
+# =============================================================================
+# FIXED JSON EXTRACTION DEFINITIONS (case-accurate for SAS)
+# =============================================================================
+
+ESS_PROCESS_TS = """
+    try(CAST(from_iso8601_timestamp(element_at(eventattributes, 'ess_process_timestamp')) AS timestamp))
+"""
+
+ESS_SRC_TS = """
+    try(CAST(from_iso8601_timestamp(element_at(eventattributes, 'ess_src_event_timestamp')) AS timestamp))
+"""
+
+SRC_HDR = """
+    try(json_parse(element_at(eventattributes, 'SourceEventHeader')))
+"""
+
+EVT_PAYLOAD = """
+    try(json_parse(element_at(eventattributes, 'eventPayload')))
+"""
+
+EVT_ID = f"""
+    try(json_extract_scalar({SRC_HDR}, '$.eventId'))
+"""
+
+EVT_TS = f"""
+    try(CAST(from_iso8601_timestamp(json_extract_scalar({SRC_HDR}, '$.eventTimestamp')) AS timestamp))
+"""
+
+# =============================================================================
+# FIXED QUERIES WITH CORRECT JSON PATHS
+# =============================================================================
+
+def q_xb80_cards(schema: str, week_start: date, week_end_p1: date, pardt: date) -> str:
+    return f"""
+    SELECT
+        event_activity_type,
+        source_event_id,
+        CAST(partition_date AS DATE) AS partition_date,
+        {ESS_PROCESS_TS} AS ess_process_timestamp,
+        {ESS_SRC_TS}     AS ess_src_event_timestamp,
+        {EVT_ID}         AS eventId,
+        {EVT_TS}         AS eventTimestamp,
+
+        try(json_extract_scalar({EVT_PAYLOAD}, '$.accountId'))       AS accountId,
+        try(json_extract_scalar({EVT_PAYLOAD}, '$.alertType'))       AS alertType,
+        try(CAST(json_extract_scalar({EVT_PAYLOAD}, '$.thresholdAmount') AS DECIMAL(10,2))) AS thresholdAmount,
+        try(json_extract_scalar({EVT_PAYLOAD}, '$.customerID'))      AS customerID,
+        try(json_extract_scalar({EVT_PAYLOAD}, '$.accountCurrency')) AS accountCurrency,
+        try(CAST(json_extract_scalar({EVT_PAYLOAD}, '$.creditLimit') AS DECIMAL(10,2)))     AS creditLimit,
+        try(json_extract_scalar({EVT_PAYLOAD}, '$.maskedAccount'))   AS maskedAccount,
+        try(json_extract_scalar({EVT_PAYLOAD}, '$.decisionId'))      AS decisionId,
+        try(CAST(json_extract_scalar({EVT_PAYLOAD}, '$.alertAmount') AS DECIMAL(10,2)))     AS alertAmount
+
+    FROM {schema}.xb80_credit_card_system_interface
+
+    WHERE
+        CAST(partition_date AS DATE) > DATE '{pardt.isoformat()}'
+        AND event_activity_type = 'Alert Decision Cards'
+        AND try(json_extract_scalar({EVT_PAYLOAD}, '$.alertType')) = 'AVAIL_CREDIT_REMAINING'
+        AND event_timestamp BETWEEN TIMESTAMP '{week_start.isoformat()} 00:00:00'
+                               AND TIMESTAMP '{week_end_p1.isoformat()} 00:00:00'
+    """
+
+
+def q_cards_dec_pref(schema: str, week_end_p1: date) -> str:
+    a = f"""
+        SELECT
+            {EVT_TS} AS event_timestamp_p,
+            event_channel_type AS event_channel_type_p,
+            event_activity_type AS event_activity_type_p,
+            CAST(partition_date AS DATE) AS partition_date_p,
+            {ESS_PROCESS_TS} AS ess_process_timestamp_p,
+            {ESS_SRC_TS} AS ess_src_event_timestamp_p,
+            {EVT_TS} AS eventTimestamp_p,
+
+            try(json_extract_scalar({SRC_HDR}, '$.eventActivityName')) AS eventActivityName_p,
+            try(json_extract_scalar({EVT_PAYLOAD}, '$.preferenceType')) AS preferenceType_p,
+            try(json_extract_scalar({EVT_PAYLOAD}, '$.clientID')) AS clientID_p,
+            try(json_extract_scalar({EVT_PAYLOAD}, '$.isBusiness')) AS isBusiness_p,
+            try(json_extract_scalar({EVT_PAYLOAD}, '$.sendAlertEligible')) AS sendAlertEligible_p,
+            try(json_extract_scalar({EVT_PAYLOAD}, '$.active')) AS active_p,
+            try(json_extract_scalar({EVT_PAYLOAD}, '$.threshold')) AS threshold_p,
+            try(json_extract_scalar({EVT_PAYLOAD}, '$.custID')) AS custID_p,
+            try(json_extract_scalar({EVT_PAYLOAD}, '$.account')) AS account_p,
+            try(json_extract_scalar({EVT_PAYLOAD}, '$.maskAccountNo')) AS maskedAccountNo_p,
+            try(json_extract_scalar({EVT_PAYLOAD}, '$.externalAccount')) AS externalAccount_p,
+            try(json_extract_scalar({EVT_PAYLOAD}, '$.productType')) AS productType_p
+
+        FROM {schema}.ffs0_client_alert_preferences_dep_initial_load
+
+        WHERE event_activity_type IN ('Create Account Preference','Update Account Preference')
+          AND try(json_extract_scalar({EVT_PAYLOAD}, '$.preferenceType')) = 'AVAIL_CREDIT_REMAINING'
+          AND try(json_extract_scalar({EVT_PAYLOAD}, '$.productType')) = 'CREDIT_CARD'
+          AND CAST(partition_date AS DATE) = DATE '2022-03-24'
+    """
+
+    b = f"""
+        SELECT
+            {EVT_TS} AS event_timestamp_p,
+            event_channel_type AS event_channel_type_p,
+            event_activity_type AS event_activity_type_p,
+            CAST(partition_date AS DATE) AS partition_date_p,
+            {ESS_PROCESS_TS} AS ess_process_timestamp_p,
+            {ESS_SRC_TS} AS ess_src_event_timestamp_p,
+            {EVT_TS} AS eventTimestamp_p,
+
+            try(json_extract_scalar({SRC_HDR}, '$.eventActivityName')) AS eventActivityName_p,
+            try(json_extract_scalar({EVT_PAYLOAD}, '$.preferenceType')) AS preferenceType_p,
+            try(json_extract_scalar({EVT_PAYLOAD}, '$.clientID')) AS clientID_p,
+            try(json_extract_scalar({EVT_PAYLOAD}, '$.isBusiness')) AS isBusiness_p,
+            try(json_extract_scalar({EVT_PAYLOAD}, '$.sendAlertEligible')) AS sendAlertEligible_p,
+            try(json_extract_scalar({EVT_PAYLOAD}, '$.active')) AS active_p,
+            try(json_extract_scalar({EVT_PAYLOAD}, '$.threshold')) AS threshold_p,
+            try(json_extract_scalar({EVT_PAYLOAD}, '$.custID')) AS custID_p,
+            try(json_extract_scalar({EVT_PAYLOAD}, '$.account')) AS account_p,
+            try(json_extract_scalar({EVT_PAYLOAD}, '$.maskAccountNo')) AS maskedAccountNo_p,
+            try(json_extract_scalar({EVT_PAYLOAD}, '$.externalAccount')) AS externalAccount_p,
+            try(json_extract_scalar({EVT_PAYLOAD}, '$.productType')) AS productType_p
+
+        FROM {schema}.ffs0_client_alert_preferences_dep
+
+        WHERE event_timestamp > TIMESTAMP '{week_end_p1.isoformat()} 00:00:00'
+          AND event_activity_type IN ('Create Account Preference','Update Account Preference')
+          AND try(json_extract_scalar({EVT_PAYLOAD}, '$.preferenceType')) = 'AVAIL_CREDIT_REMAINING'
+          AND try(json_extract_scalar({EVT_PAYLOAD}, '$.productType')) = 'CREDIT_CARD'
+    """
+
+    return f"SELECT * FROM ({a}) UNION SELECT * FROM ({b})"
+
+
+def q_fft0_inbox(schema: str, week_start: date) -> str:
+    return f"""
+    SELECT
+        {ESS_PROCESS_TS} AS ess_process_timestamp_a,
+        event_activity_type AS event_activity_type_a,
+        source_event_id AS source_event_id_a,
+        CAST(partition_date AS DATE) AS partition_date_a,
+        event_timestamp AS event_timestamp_a,
+        {EVT_ID} AS eventId_a,
+        {EVT_TS} AS eventTimestamp_a,
+
+        try(json_extract_scalar({SRC_HDR}, '$.eventActivityName')) AS eventActivityName_a,
+        try(json_extract_scalar({EVT_PAYLOAD}, '$.alertSent')) AS alertSent_a,
+        try(json_extract_scalar({EVT_PAYLOAD}, '$.sendInbox')) AS sendInbox_a,
+        try(json_extract_scalar({EVT_PAYLOAD}, '$.alertType')) AS alertType_a,
+        try(CAST(json_extract_scalar({EVT_PAYLOAD}, '$.thresholdAmount') AS DECIMAL(12,2))) AS thresholdAmount_a,
+        try(json_extract_scalar({EVT_PAYLOAD}, '$.sendSMS')) AS sendSMS_a,
+        try(json_extract_scalar({EVT_PAYLOAD}, '$.sendPush')) AS sendPush_a,
+        try(json_extract_scalar({EVT_PAYLOAD}, '$.maskedAccount')) AS maskedAccount_a,
+        try(json_extract_scalar({EVT_PAYLOAD}, '$.reasonCode')) AS reasonCode_a,
+        try(json_extract_scalar({EVT_PAYLOAD}, '$.decisionId')) AS decisionId_a,
+        try(CAST(json_extract_scalar({EVT_PAYLOAD}, '$.alertAmount') AS DECIMAL(12,2))) AS alertAmount_a,
+        try(json_extract_scalar({EVT_PAYLOAD}, '$.accountID')) AS accountId_a,
+        try(json_extract_scalar({EVT_PAYLOAD}, '$.account')) AS account_a,
+        try(json_extract_scalar({EVT_PAYLOAD}, '$.accountProduct')) AS accountProduct_a,
+        try(json_extract_scalar({EVT_PAYLOAD}, '$.sendEmail')) AS sendEmail_a
+
+    FROM {schema}.fft0_alert_inbox_dep
+
+    WHERE event_activity_type = 'Alert Delivery Audit'
+      AND try(json_extract_scalar({EVT_PAYLOAD}, '$.alertType')) = 'AVAIL_CREDIT_REMAINING'
+      AND event_timestamp > TIMESTAMP '{week_start.isoformat()} 00:00:00'
+    """
