@@ -1,0 +1,69 @@
+WITH base AS (
+    SELECT
+        try(CAST(from_iso8601_timestamp(element_at(eventattributes, 'ess_process_timestamp')) 
+            AS timestamp)) AS ess_process_timestamp_c,
+
+        try(CAST(from_iso8601_timestamp(element_at(eventattributes, 'ess_src_event_timestamp')) 
+            AS timestamp)) AS ess_src_event_timestamp_c,
+
+        try(json_parse(element_at(eventattributes, 'SourceEventHeader'))) AS hdr,
+        try(json_parse(element_at(eventattributes, 'eventPayload')))      AS payload,
+        partition_date
+    FROM prod_brt0_ess.zgv0___colt_front_end_system
+    WHERE partition_date > DATE '{dc.par_dt.strftime("%Y-%m-%d")}'
+)
+SELECT
+    ess_process_timestamp_c,
+    ess_src_event_timestamp_c,
+
+    -- SAS: regexp_replace → eventTimestamp_c
+    try(
+        CAST(
+            from_iso8601_timestamp(
+                json_extract_scalar(hdr, '$.eventTimestamp')
+            ) AS timestamp
+        )
+    ) AS eventtimestamp_c,
+
+    json_extract_scalar(hdr, '$.eventActivityName') AS eventactivityname_c,
+
+    json_extract_scalar(payload, '$.alertType') AS alerttype_c,
+    json_extract_scalar(payload, '$.clientId')  AS clientid_c,
+
+    try(CAST(json_extract_scalar(payload, '$.thresholdAmount') AS double)) AS thresholdamount_c,
+
+    try(
+        CAST(
+            from_iso8601_timestamp(
+                json_extract_scalar(payload, '$.transactionTimestamp')
+            ) AS timestamp
+        )
+    ) AS transactiontimestamp_c,
+
+    try(CAST(json_extract_scalar(payload, '$.alertAmount') AS double))       AS alertamount_c,
+    try(CAST(json_extract_scalar(payload, '$.previousBalance') AS double))   AS previousbalance_c,
+
+    json_extract_scalar(payload, '$.accountStatus')    AS accountstatus_c,
+    json_extract_scalar(payload, '$.accountId')        AS accountid,
+    json_extract_scalar(payload, '$.processingCentre') AS processingcentre_c,
+    json_extract_scalar(payload, '$.accountCloseInd')  AS accountcloseind_c,
+    json_extract_scalar(payload, '$.decisionId')       AS decisionid,
+    json_extract_scalar(payload, '$.reasonCodes')      AS reasoncodes_c
+
+FROM base
+
+-- SAS version:
+-- get_json_object(payload,'$.alertType') = 'DDA_BALANCE_ALERT'
+WHERE json_extract_scalar(payload, '$.alertType') = 'DDA_BALANCE_ALERT'
+
+-- SAS:
+-- get_json_object(payload,'$.transactionTimestamp') between snap_dt_hive and today
+AND try(
+        CAST(
+            from_iso8601_timestamp(
+                json_extract_scalar(payload, '$.transactionTimestamp')
+            ) AS timestamp
+        )
+    )
+    BETWEEN TIMESTAMP '{dc.snap_dt_hive} 00:00:00'
+        AND TIMESTAMP '{dc.today.strftime("%Y-%m-%d")} 23:59:59'
