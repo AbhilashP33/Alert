@@ -1,97 +1,396 @@
-proc sql;
-  connect to trino (
-    server="strplvaexh0001.fg.rbc.com"
-    port=8443
-    catalog="hive"
-    schema="prod_brt0_ess"
-    user="&USER."
-    password="&PASSWORD."
-    ssl="true"
-  );
+#!/usr/bin/env python3
+"""
+C86 – Trino query layer (Python)
 
-  create table work.c86_colt as
-  select * from connection to trino
-  (
+- Replaces SAS Hive/Hadoop procs with Trino SQL.
+- Designed to be called from your main C86 pipeline.
+- All Trino SQL lives in QUERIES (Option A).
+"""
 
-    WITH raw AS (
-        SELECT
-            eventattributes,
-            partition_date
-        FROM prod_brt0_ess.zgv0___colt_front_end_system
-        WHERE partition_date BETWEEN DATE '%sysfunc(putn(&snap_dt_hive, yymmdd10.))'
-                              AND DATE '%sysfunc(putn(&today, yymmdd10.))'
-            AND CAST(element_at(eventattributes, 'eventPayload') AS varchar)
-                LIKE '%DDA_BALANCE_ALERT%'
-    ),
+import os
+import logging
+from dataclasses import dataclass
+from datetime import date, timedelta
+from typing import Dict
 
-    base AS (
-        SELECT
-            try(json_parse(element_at(eventattributes, 'eventPayload'))) AS payload,
-            try(json_parse(element_at(eventattributes, 'SourceEventHeader'))) AS hdr,
-            
-            try(CAST(from_iso8601_timestamp(
-                element_at(eventattributes,'ess_process_timestamp')
-            ) AS timestamp)) AS ess_process_timestamp_c,
+import pandas as pd
+import trino
 
-            try(CAST(from_iso8601_timestamp(
-                element_at(eventattributes,'ess_src_event_timestamp')
-            ) AS timestamp)) AS ess_src_event_timestamp_c,
+# -----------------------------------------------------------------------------
+# LOGGING
+# -----------------------------------------------------------------------------
+logger = logging.getLogger("c86_trino")
+if not logger.handlers:
+    logger.setLevel(logging.INFO)
+    _h = logging.StreamHandler()
+    _h.setFormatter(logging.Formatter("%(asctime)s [%(levelname)s] %(message)s"))
+    logger.addHandler(_h)
 
-            partition_date
-        FROM raw
+# -----------------------------------------------------------------------------
+# DATE CONTEXT (minimal, but SAS-compatible where it matters)
+# -----------------------------------------------------------------------------
+
+@dataclass
+class DateContext:
+    """
+    Minimal subset needed for Trino queries:
+
+    - par_dt       → &pardt (week_start - 7 days)
+    - snap_dt_hive → &snap_dt_hive (week_start as 'YYYY-MM-DD')
+    - today        → &today (tday, Wednesday anchor)
+    """
+    par_dt: date
+    snap_dt_hive: str
+    today: date
+
+
+def _week_anchor_wed(today_: date) -> date:
+    """
+    SAS: tday = intnx('week.4', today(), 0);
+    week.4 => weeks starting on Wednesday; take last-or-same Wednesday.
+    """
+    # Monday=0..Sunday=6; Wednesday=2
+    days_since_wed = (today_.weekday() - 2) % 7
+    return today_ - timedelta(days=days_since_wed)
+
+
+def compute_date_context(ini_run: str = "N") -> DateContext:
+    """
+    Rough port of the SAS date block for what Trino actually needs.
+
+      tday      = intnx('week.4', today(), 0);     /* Wednesday */
+      week_end  = tday - 2;                        /* Monday */
+      if ini_run = 'N' then week_start = week_end - 6;
+      else week_start = launch_dt;
+      par_dt    = week_start - 7;
+      snap_dt_hive = week_start (YYYY-MM-DD);
+      today     = tday (YYYY-MM-DD).
+
+    We keep:
+
+      - par_dt (date)
+      - snap_dt_hive (str)
+      - today (date)
+    """
+    today_real = date.today()
+    tday = _week_anchor_wed(today_real)
+    week_end = tday - timedelta(days=2)
+
+    # Launch date from SAS (30JUN2022)
+    launch_dt = date(2022, 6, 30)
+
+    if ini_run == "N":
+        week_start = week_end - timedelta(days=6)
+    else:
+        week_start = launch_dt
+
+    par_dt = week_start - timedelta(days=7)
+    snap_dt_hive = week_start.strftime("%Y-%m-%d")
+
+    return DateContext(
+        par_dt=par_dt,
+        snap_dt_hive=snap_dt_hive,
+        today=tday,
     )
 
+# -----------------------------------------------------------------------------
+# SHARED TRINO JSON / TIMESTAMP EXPRESSIONS
+# -----------------------------------------------------------------------------
+
+ESS_PROCESS_TS = (
+    "try(CAST(from_iso8601_timestamp("
+    "element_at(eventattributes, 'ess_process_timestamp')) AS timestamp))"
+)
+
+ESS_SRC_TS = (
+    "try(CAST(from_iso8601_timestamp("
+    "element_at(eventattributes, 'ess_src_event_timestamp')) AS timestamp))"
+)
+
+SRC_HDR = "try(json_parse(element_at(eventattributes, 'SourceEventHeader')))"
+EVT_PAYLOAD = "try(json_parse(element_at(eventattributes, 'eventPayload')))"
+
+EVT_TS = (
+    "try(CAST(from_iso8601_timestamp("
+    "json_extract_scalar({hdr}, '$.eventTimestamp')) AS timestamp))"
+).format(hdr=SRC_HDR)
+
+# -----------------------------------------------------------------------------
+# TRINO SQL QUERIES (Option A)
+# Placeholders:
+#   {pardt}        -> dc.par_dt.isoformat()
+#   {snap_dt_hive} -> dc.snap_dt_hive
+#   {today}        -> dc.today.isoformat()
+# -----------------------------------------------------------------------------
+
+QUERIES: Dict[str, str] = {
+    # ----------------------------------------------------------------------
+    # PREF_INIT – initial preference load (fixed date)
+    # ----------------------------------------------------------------------
+    "pref_init": f"""
+WITH base AS (
     SELECT
-        ess_process_timestamp_c,
-        ess_src_event_timestamp_c,
+        {ESS_PROCESS_TS} AS ess_process_timestamp_p,
+        {ESS_SRC_TS}     AS ess_src_event_timestamp_p,
+        {SRC_HDR}        AS hdr,
+        {EVT_PAYLOAD}    AS payload,
+        partition_date
+    FROM prod_brt0_ess.ffs0___client_alert_preferences_dep___initial_load
+    WHERE partition_date = DATE '2022-03-24'
+)
+SELECT
+    ess_process_timestamp_p,
+    ess_src_event_timestamp_p,
+    {EVT_TS} AS eventtimestamp_p,
 
-        try(
-            CAST(
-                from_iso8601_timestamp(
-                    json_extract_scalar(hdr,'$.eventTimestamp')
-                ) AS timestamp
-            )
-        ) AS eventtimestamp_c,
+    json_extract_scalar(payload, '$.preferenceType') AS preferencetype_p,
+    json_extract_scalar(payload, '$.clientId')       AS clientid_p,
+    json_extract_scalar(payload, '$.sendAlertEligible') AS sendalerteligible_p,
+    json_extract_scalar(payload, '$.active')         AS active_p,
+    try(CAST(json_extract_scalar(payload, '$.threshold') AS double)) AS threshold_p,
+    json_extract_scalar(payload, '$.optOutDate')     AS optoutdate_p,
+    json_extract_scalar(payload, '$.account')        AS account,
+    json_extract_scalar(payload, '$.productType')    AS producttype_p
+FROM base
+WHERE json_extract_scalar(payload, '$.preferenceType') = 'DDA_BALANCE_ALERT'
+""",
 
-        json_extract_scalar(hdr,'$.eventActivityName') AS eventactivityname_c,
+    # ----------------------------------------------------------------------
+    # PREF_NEW – incremental preferences
+    #   SAS had no date predicate; we add partition_date >= pardt
+    # ----------------------------------------------------------------------
+    "pref_new": f"""
+WITH base AS (
+    SELECT
+        {ESS_PROCESS_TS} AS ess_process_timestamp_p,
+        {ESS_SRC_TS}     AS ess_src_event_timestamp_p,
+        {SRC_HDR}        AS hdr,
+        {EVT_PAYLOAD}    AS payload,
+        partition_date
+    FROM prod_brt0_ess.ffs0___client_alert_preferences_dep
+    WHERE partition_date >= DATE '{{pardt}}'
+)
+SELECT
+    ess_process_timestamp_p,
+    ess_src_event_timestamp_p,
+    {EVT_TS} AS eventtimestamp_p,
 
-        json_extract_scalar(payload,'$.alertType') AS alerttype_c,
-        json_extract_scalar(payload,'$.clientId') AS clientid_c,
-        json_extract_scalar(payload,'$.accountId') AS accountid,
+    json_extract_scalar(payload, '$.preferenceType') AS preferencetype_p,
+    json_extract_scalar(payload, '$.clientId')       AS clientid_p,
+    json_extract_scalar(payload, '$.sendAlertEligible') AS sendalerteligible_p,
+    json_extract_scalar(payload, '$.active')         AS active_p,
+    try(CAST(json_extract_scalar(payload, '$.threshold') AS double)) AS threshold_p,
+    json_extract_scalar(payload, '$.optOutDate')     AS optoutdate_p,
+    json_extract_scalar(payload, '$.accountId')      AS accountid,
+    json_extract_scalar(payload, '$.productType')    AS producttype_p
+FROM base
+WHERE json_extract_scalar(payload, '$.preferenceType') = 'DDA_BALANCE_ALERT'
+""",
 
-        try(CAST(json_extract_scalar(payload,'$.thresholdAmount') AS double)) AS thresholdamount_c,
+    # ----------------------------------------------------------------------
+    # COLT_START – main COLT front-end feed
+    # ----------------------------------------------------------------------
+    "colt_start": f"""
+WITH base AS (
+    SELECT
+        {ESS_PROCESS_TS} AS ess_process_timestamp_c,
+        {ESS_SRC_TS}     AS ess_src_event_timestamp_c,
+        {SRC_HDR}        AS hdr,
+        {EVT_PAYLOAD}    AS payload,
+        partition_date
+    FROM prod_brt0_ess.zgv0___colt_front_end_system
+    WHERE partition_date > DATE '{{pardt}}'
+)
+SELECT
+    ess_process_timestamp_c,
+    ess_src_event_timestamp_c,
 
-        try(
-            CAST(
-                from_iso8601_timestamp(
-                    json_extract_scalar(payload,'$.transactionTimestamp')
-                ) AS timestamp
-            )
-        ) AS transactiontimestamp_c,
+    -- eventTimestamp_c
+    try(
+        CAST(
+            from_iso8601_timestamp(
+                json_extract_scalar(hdr, '$.eventTimestamp')
+            ) AS timestamp
+        )
+    ) AS eventtimestamp_c,
 
-        try(CAST(json_extract_scalar(payload,'$.alertAmount') AS double)) AS alertamount_c,
-        try(CAST(json_extract_scalar(payload,'$.previousBalance') AS double)) AS previousbalance_c,
+    json_extract_scalar(hdr, '$.eventActivityName') AS eventactivityname_c,
 
-        json_extract_scalar(payload,'$.accountStatus') AS accountstatus_c,
-        json_extract_scalar(payload,'$.processingCentre') AS processingcentre_c,
-        json_extract_scalar(payload,'$.accountCloseInd') AS accountcloseind_c,
-        json_extract_scalar(payload,'$.decisionId') AS decisionid,
-        json_extract_scalar(payload,'$.reasonCodes') AS reasoncodes_c
+    json_extract_scalar(payload, '$.alertType') AS alerttype_c,
+    json_extract_scalar(payload, '$.clientId')  AS clientid_c,
 
-    FROM base
+    try(CAST(json_extract_scalar(payload, '$.thresholdAmount') AS double)) AS thresholdamount_c,
 
-    WHERE json_extract_scalar(payload,'$.alertType') = 'DDA_BALANCE_ALERT'
-      AND try(
-            CAST(
-                from_iso8601_timestamp(
-                    json_extract_scalar(payload,'$.transactionTimestamp')
-                ) AS timestamp
-            )
-          )
-          BETWEEN TIMESTAMP '%sysfunc(putn(&snap_dt_hive, yymmdd10.)) 00:00:00'
-              AND TIMESTAMP '%sysfunc(putn(&today, yymmdd10.)) 23:59:59'
+    try(
+        CAST(
+            from_iso8601_timestamp(
+                json_extract_scalar(payload, '$.transactionTimestamp')
+            ) AS timestamp
+        )
+    ) AS transactiontimestamp_c,
 
-  );
+    try(CAST(json_extract_scalar(payload, '$.alertAmount')     AS double)) AS alertamount_c,
+    try(CAST(json_extract_scalar(payload, '$.previousBalance') AS double)) AS previousbalance_c,
 
-  disconnect from trino;
-quit;
+    json_extract_scalar(payload, '$.accountStatus')    AS accountstatus_c,
+    json_extract_scalar(payload, '$.accountId')        AS accountid,
+    json_extract_scalar(payload, '$.processingCentre') AS processingcentre_c,
+    json_extract_scalar(payload, '$.accountCloseInd')  AS accountcloseind_c,
+    json_extract_scalar(payload, '$.decisionId')       AS decisionid,
+    json_extract_scalar(payload, '$.reasonCodes')      AS reasoncodes_c
+FROM base
+WHERE json_extract_scalar(payload, '$.alertType') = 'DDA_BALANCE_ALERT'
+  AND try(
+        CAST(
+            from_iso8601_timestamp(
+                json_extract_scalar(payload, '$.transactionTimestamp')
+            ) AS timestamp
+      ))
+    BETWEEN TIMESTAMP '{{snap_dt_hive}} 00:00:00'
+        AND TIMESTAMP '{{today}} 23:59:59'
+""",
+
+    # ----------------------------------------------------------------------
+    # ALERT_INBOX – inbox feed
+    # ----------------------------------------------------------------------
+    "alert_inbox": f"""
+WITH base AS (
+    SELECT
+        {ESS_PROCESS_TS} AS ess_process_timestamp_a,
+        {ESS_SRC_TS}     AS ess_src_event_timestamp_a,
+        {SRC_HDR}        AS hdr,
+        {EVT_PAYLOAD}    AS payload,
+        partition_date
+    FROM prod_brt0_ess.fft0___alert_inbox_dep
+    WHERE partition_date > DATE '{{pardt}}'
+)
+SELECT
+    ess_process_timestamp_a,
+    ess_src_event_timestamp_a,
+
+    try(
+        CAST(
+            from_iso8601_timestamp(
+                json_extract_scalar(hdr, '$.eventTimestamp')
+            ) AS timestamp
+        )
+    ) AS eventtimestamp_a,
+
+    json_extract_scalar(payload, '$.alertType')  AS alerttype_a,
+    json_extract_scalar(payload, '$.decisionId') AS decisionid,
+    json_extract_scalar(payload, '$.accountId')  AS accountid,
+
+    try(CAST(json_extract_scalar(payload, '$.alertAmount')     AS double)) AS alertamount_a,
+    try(CAST(json_extract_scalar(payload, '$.thresholdAmount') AS double)) AS thresholdamount_a,
+
+    json_extract_scalar(payload, '$.alertSent')  AS alertsent_a,
+    json_extract_scalar(payload, '$.reasonCode') AS reasoncode_a
+FROM base
+WHERE json_extract_scalar(payload, '$.alertType') = 'DDA_BALANCE_ALERT'
+  AND ess_src_event_timestamp_a >= TIMESTAMP '{{snap_dt_hive}} 00:00:00'
+"""
+}
+
+# -----------------------------------------------------------------------------
+# TRINO CONNECTION
+# -----------------------------------------------------------------------------
+
+def get_trino_connection():
+    """
+    Very simple Trino connection.
+    You already have a working one in another script; align env vars to that.
+
+    Env vars supported:
+      TRINO_HOST    (default: strplpaed12007.fg.rbc.com)
+      TRINO_PORT    (default: 8443)
+      TRINO_USER    (required – no sane default)
+      TRINO_CATALOG (default: hive)
+      TRINO_SCHEMA  (default: prod_brt0_ess)
+    """
+    host = os.environ.get("TRINO_HOST", "strplpaed12007.fg.rbc.com")
+    port = int(os.environ.get("TRINO_PORT", "8443"))
+    user = os.environ.get("TRINO_USER")
+    catalog = os.environ.get("TRINO_CATALOG", "hive")
+    schema = os.environ.get("TRINO_SCHEMA", "prod_brt0_ess")
+
+    if not user:
+        raise RuntimeError("TRINO_USER is not set in environment")
+
+    logger.info(
+        "Connecting to Trino host=%s port=%s catalog=%s schema=%s",
+        host,
+        port,
+        catalog,
+        schema,
+    )
+
+    conn = trino.dbapi.connect(
+        host=host,
+        port=port,
+        user=user,
+        catalog=catalog,
+        schema=schema,
+        http_scheme="https",
+        # If you need auth, uncomment and plug in your mechanism:
+        # auth=trino.auth.BasicAuthentication(user, "PASSWORD_OR_TOKEN"),
+    )
+    return conn
+
+# -----------------------------------------------------------------------------
+# QUERY RENDER / EXECUTION HELPERS
+# -----------------------------------------------------------------------------
+
+def render_query(name: str, dc: DateContext) -> str:
+    """
+    Fill placeholders in QUERIES[name] using DateContext.
+    """
+    if name not in QUERIES:
+        raise KeyError("Unknown query name: %r" % name)
+
+    template = QUERIES[name]
+    sql = template.format(
+        pardt=dc.par_dt.isoformat(),
+        snap_dt_hive=dc.snap_dt_hive,
+        today=dc.today.isoformat(),
+    )
+    logger.debug("Rendered SQL for %s:\n%s", name, sql)
+    return sql
+
+
+def run_trino_query(conn, name: str, dc: DateContext) -> pd.DataFrame:
+    """
+    Execute the named Trino query and return a DataFrame.
+    """
+    sql = render_query(name, dc)
+    logger.info("Running Trino query [%s]...", name)
+    df = pd.read_sql(sql, conn)
+    logger.info("Query [%s] returned %d rows", name, len(df))
+    return df
+
+# Convenience wrappers – match your existing Python names
+def fetch_pref_init(conn, dc: DateContext) -> pd.DataFrame:
+    return run_trino_query(conn, "pref_init", dc)
+
+def fetch_pref_new(conn, dc: DateContext) -> pd.DataFrame:
+    return run_trino_query(conn, "pref_new", dc)
+
+def fetch_colt_start(conn, dc: DateContext) -> pd.DataFrame:
+    return run_trino_query(conn, "colt_start", dc)
+
+def fetch_alert_inbox(conn, dc: DateContext) -> pd.DataFrame:
+    return run_trino_query(conn, "alert_inbox", dc)
+
+# -----------------------------------------------------------------------------
+# OPTIONAL: quick manual test (will fail if env not configured)
+# -----------------------------------------------------------------------------
+if __name__ == "__main__":
+    logger.info("Testing Trino query layer for C86...")
+    dc = compute_date_context(ini_run="N")
+    conn = get_trino_connection()
+    # Smoke test: just row counts to avoid massive scans in dev
+    for name in ("pref_init", "pref_new", "colt_start", "alert_inbox"):
+        try:
+            df = run_trino_query(conn, name, dc)
+            logger.info("Sample [%s]: %d rows", name, len(df))
+        except Exception as exc:
+            logger.error("Failed running [%s]: %s", name, exc)
