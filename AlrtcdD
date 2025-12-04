@@ -1,86 +1,190 @@
-# ---------- SAS-TRUE WEEKLY SUMMARY (3 rows total) ----------
+# --------------------------------------------------------------------------------------
+# SECTION 1: SETUP & CONNECTIONS (Python equivalent)
+# --------------------------------------------------------------------------------------
 
-def _snapdate(d):
-    if pd.isna(d): return pd.NaT
-    d = pd.to_datetime(d).date()
-    weekday = d.weekday()  # Wed = 2
-    return d + timedelta(days=(2 - weekday) % 7)
+def get_paths(env: str = "PROD", regpath_override: str | None = None) -> Paths:
+    """
+    Rough equivalent of SAS regpath/logpath/outpath/alrtdata libname setup.
+    """
+    if regpath_override:
+        reg_root = Path(regpath_override)
+    else:
+        if env.upper() == "PROD":
+            reg_root = Path("/sas/RSD/REG")
+        else:
+            reg_root = Path("/sas/RSD/REG_DEV")
 
-df_final["SnapDate"] = df_final["decision_date"].apply(_snapdate)
-df_final["DateCompleted"] = report_dt
+    logpath = reg_root / "C86" / "log" / "alert" / "dda"
+    outpath = reg_root / "C86" / "output" / "alert" / "dda"
+    alrtdata = outpath  # same as SAS libname
 
-# ---------- ACCURACY ----------
-accuracy_df = (
-    sample_df
-    .assign(
-        ControlRisk="Accuracy",
-        TestType="Sample",
-        RDE="Alert010_Accuracy_Available_Credit",
-        CommentCode=lambda d: np.where(
-            d["threshold_limit_check"] == "Y", "COM16", "COM19"
-        ),
+    for p in (logpath, outpath, alrtdata):
+        p.mkdir(parents=True, exist_ok=True)
+
+    return Paths(regpath=reg_root, logpath=logpath, outpath=outpath, alrtdata=alrtdata)
+
+
+def init_logging_file(paths: Paths) -> Path:
+    """
+    Implements the SAS proc printto > log file behaviour.
+    """
+    today_ymd = date.today().strftime("%Y%m%d")
+    logfile = paths.logpath / f"C86_Alert_DDA_{today_ymd}.log"
+
+    file_handler = logging.FileHandler(logfile, mode="w")
+    file_handler.setFormatter(logging.Formatter("%(asctime)s [%(levelname)s] %(message)s"))
+    logger.addHandler(file_handler)
+
+    logger.info(f"Log file: {logfile}")
+    return logfile
+
+
+# ===== NEW CONFIG / CONNECTION LAYER ===================================================
+
+def load_config(config_path: str | Path = "config.ini") -> dict:
+    """
+    Load Trino + Teradata settings from config.ini.
+
+    Expected structure:
+
+      [trino]
+      host = strplvaexh001.fg.rbc.com
+      port = 8443
+      username = Hive_SRV_ID
+      password = Hive_Pswd
+      http_scheme = https
+      catalog = edl0_im
+      schema = prod_brt0_ess
+      source = c86_alerts_cards
+      env = PROD
+
+      [teradata]
+      config_json = TeradataConnection_T.json
+    """
+    path = Path(config_path)
+    if not path.exists():
+        raise FileNotFoundError(f"Missing config file: {path}")
+
+    parser = configparser.ConfigParser()
+    parser.read(path)
+
+    c = parser["trino"]
+
+    conf: dict[str, object] = {
+        "host": c.get("host", "strplvaexh001.fg.rbc.com"),
+        "port": c.getint("port", fallback=8443),
+        "user": c.get("username"),
+        "password": c.get("password", fallback=None),
+        "http_scheme": c.get("http_scheme", fallback="https"),
+        "catalog": c.get("catalog", fallback="edl0_im"),
+        "schema": c.get("schema", fallback="prod_brt0_ess"),
+        "source": c.get("source", fallback="c86_alerts_cards"),
+        "env": c.get("env", fallback="PROD"),
+    }
+
+    td_section = parser["teradata"]
+    conf["teradata_json"] = td_section.get(
+        "config_json", fallback="TeradataConnection_T.json"
     )
-    .groupby(["ControlRisk","TestType","RDE","CommentCode"], dropna=False)
-    .agg(
-        Volume=("decisionid","count"),
-        bal=("alertamount","sum"),
-        Amount=("thresholdamount","sum"),
-    )
-    .reset_index()
-)
 
-# ---------- TIMELINESS ----------
-timeliness_df = (
-    df_final
-    .assign(
-        ControlRisk="Timeliness",
-        TestType="Anomaly",
-        RDE="Alert011_Timeliness_SLA",
-        CommentCode=lambda d: np.where(d["sla_ind"] == "Y","COM16","COM19"),
-    )
-    .groupby(["ControlRisk","TestType","RDE","CommentCode"], dropna=False)
-    .agg(
-        Volume=("decisionid","count"),
-        bal=("alertamount","sum"),
-        Amount=("thresholdamount","sum"),
-    )
-    .reset_index()
-)
+    return conf
 
-# ---------- COMPLETENESS ----------
-completeness_df = (
-    df_final
-    .assign(
-        ControlRisk="Completeness",
-        TestType="Reconciliation",
-        RDE="Alert012_Completeness_All_Clients",
-        CommentCode=lambda d: np.where(
-            d["decisionid_a"].notna(), "COM16", "COM19"
-        ),
-    )
-    .groupby(["ControlRisk","TestType","RDE","CommentCode"], dropna=False)
-    .agg(
-        Volume=("decisionid","count"),
-        bal=("alertamount","sum"),
-        Amount=("thresholdamount","sum"),
-    )
-    .reset_index()
-)
 
-# ---------- CONCAT (total = 3 rows) ----------
-alert_cards_ac_week = pd.concat(
-    [accuracy_df, timeliness_df, completeness_df],
-    ignore_index=True
-)
+def get_trino_conn(conf: dict) -> trino.dbapi.Connection:
+    """
+    Build a Trino connection exactly like the SAS JDBC connect.
+    """
+    auth = None
+    if conf.get("password"):
+        auth = BasicAuthentication(conf["user"], conf["password"])
 
-# ---------- Add SAS fixed columns ----------
-alert_cards_ac_week["RegulatoryName"] = "C86"
-alert_cards_ac_week["LOB"] = "Credit Cards"
-alert_cards_ac_week["ReportName"] = "Credit Cards C86 Alerts"
-alert_cards_ac_week["TestPeriod"] = "Portfolio"
-alert_cards_ac_week["ProductType"] = "Credit Cards"
-alert_cards_ac_week["SnapDate"] = report_dt
-alert_cards_ac_week["DateCompleted"] = report_dt
-alert_cards_ac_week["Segment"] = "."
-alert_cards_ac_week["HoldoutFlag"] = "N"
-alert_cards_ac_week["Comments"] = "Pass"
+    return trino.dbapi.connect(
+        host=conf["host"],
+        port=int(conf["port"]),
+        user=conf["user"],
+        http_scheme=conf["http_scheme"],
+        auth=auth,
+        catalog=conf["catalog"],
+        schema=conf["schema"],
+        source=conf["source"],
+    )
+
+
+def get_teradata_conn(config_json: str) -> teradatasql.TeradataConnection:
+    """
+    Load Teradata credentials from JSON and open a connection.
+
+    JSON must contain:
+      {
+        "host": "uasasp11.fg.rbc.com",
+        "user": "TD_USER",
+        "password": "TD_PASSWORD"
+      }
+    """
+    path = Path(config_json)
+    if not path.exists():
+        raise FileNotFoundError(f"Missing Teradata config JSON: {path}")
+
+    with path.open("r") as f:
+        cfg = json.load(f)
+
+    return teradatasql.connect(
+        host=cfg["host"],
+        user=cfg["user"],
+        password=cfg["password"],
+    )
+
+
+def build_connections(config_path: str | Path = "config.ini"):
+    """
+    Single entry point used by main() to get both DB connections.
+    """
+    conf = load_config(config_path)
+
+    logger.info("Establishing Trino connection...")
+    conn_trino = get_trino_conn(conf)
+
+    logger.info("Establishing Teradata connection...")
+    conn_td = get_teradata_conn(conf["teradata_json"])
+
+    return conn_trino, conn_td, conf
+
+# --------------------------------------------------------------------------------------
+# MAIN ORCHESTRATION
+# --------------------------------------------------------------------------------------
+
+def main(
+    env: str = "PROD",
+    regpath_override: str | None = None,
+    config_path: str | Path = "config.ini",
+):
+    paths = get_paths(env, regpath_override)
+    logfile = init_logging_file(paths)
+
+    ini_run = ini_check(paths)
+    logger.info(f"ini_run = {ini_run}")
+
+    dc = compute_dates(ini_run)
+    logger.info(f"Date context: {dc}")
+
+    # --- NEW: centralised connection build ---
+    conn_trino, conn_td, conf = build_connections(config_path)
+
+    # --- Hive→Trino pulls ---
+    pref_init = fetch_pref_init(conn_trino)
+    pref_new = fetch_pref_new(conn_trino)
+    colt_start = fetch_colt_start(conn_trino, dc)
+    alert_inbox = fetch_alert_inbox(conn_trino, dc)
+
+    # ... rest of your main stays EXACTLY the same ...
+    # (no change below this comment, keep your existing code)
+    # ------------------------------------------------------------------
+    # [KEEP all existing logic from calendar fetch down to final logging]
+    # ------------------------------------------------------------------
+
+
+if __name__ == "__main__":
+    env = os.environ.get("C86_ENV", "PROD")
+    reg_override = os.environ.get("C86_REGPATH_OVERRIDE")
+    config_path = os.environ.get("C86_CONFIG_PATH", "config.ini")
+    main(env=env, regpath_override=reg_override, config_path=config_path)
