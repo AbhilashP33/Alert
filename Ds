@@ -1,0 +1,87 @@
+proc sql noprint;
+    CONNECT TO JDBC AS trino (
+        CLASSPATH="/sas/tpa/jdbc/trinojdbc.jar"
+        DRIVERCLASS="io.trino.jdbc.TrinoDriver"
+        USER="PRYU0SRVWIN"
+        PASSWORD="sM0c3Mx66CBQs46"
+        URL="jdbc:trino://strplvaexh0001.fg.rbc.com:8443/edl0_im/prod_brt0_ess/?&SSL=true"
+    );
+
+    create table work.colt_start1 as
+    select * from connection to trino (
+
+        WITH raw AS (
+            SELECT
+                eventattributes,
+                partition_date
+            FROM prod_brt0_ess.zgv0___colt_front_end_system
+            WHERE partition_date > DATE &pardt
+              AND CAST(element_at(eventattributes,'eventPayload') AS varchar)
+                    LIKE '%DDA_BALANCE_ALERT%'
+        ),
+
+        base AS (
+            SELECT
+                try(json_parse(element_at(eventattributes,'eventPayload'))) AS payload,
+                try(json_parse(element_at(eventattributes,'SourceEventHeader'))) AS hdr,
+                try(
+                    CAST(
+                        from_iso8601_timestamp(
+                            element_at(eventattributes,'ess_process_timestamp')
+                        ) AS timestamp
+                    )
+                ) AS ess_process_timestamp_c,
+                try(
+                    CAST(
+                        from_iso8601_timestamp(
+                            element_at(eventattributes,'ess_src_event_timestamp')
+                        ) AS timestamp
+                    )
+                ) AS ess_src_event_timestamp_c,
+                partition_date
+            FROM raw
+        )
+
+        SELECT
+            ess_process_timestamp_c,
+            ess_src_event_timestamp_c,
+
+            try(
+                CAST(
+                    from_iso8601_timestamp(
+                        json_extract_scalar(payload,'$.transactionTimestamp')
+                    ) AS timestamp
+                )
+            ) AS eventtimestamp_c,
+
+            json_extract_scalar(hdr,'$.eventActivityName') AS eventactivityname_c,
+            json_extract_scalar(payload,'$.alertType')     AS alerttype_c,
+            json_extract_scalar(payload,'$.clientId')      AS clientid_c,
+            json_extract_scalar(payload,'$.accountId')     AS accountid_c,
+
+            try(CAST(json_extract_scalar(payload,'$.thresholdAmount') AS double)) AS thresholdamount_c,
+            try(CAST(json_extract_scalar(payload,'$.alertAmount') AS double))       AS alertamount_c,
+            try(CAST(json_extract_scalar(payload,'$.previousBalance') AS double))   AS previousbalance_c,
+
+            json_extract_scalar(payload,'$.accountStatus') AS accountstatus_c,
+            json_extract_scalar(payload,'$.processingCentre') AS processingcentre_c,
+            json_extract_scalar(payload,'$.accountcloseInd') AS accountcloseind_c,
+            json_extract_scalar(payload,'$.decisionId') AS decisionid,
+            json_extract_scalar(payload,'$.reasonCodes') AS reasoncodes_c
+
+        FROM base
+
+        WHERE json_extract_scalar(payload,'$.alertType') = 'DDA_BALANCE_ALERT'
+
+          AND try(
+                CAST(
+                    from_iso8601_timestamp(
+                        json_extract_scalar(payload,'$.transactionTimestamp')
+                    ) AS timestamp
+                )
+              ) BETWEEN &snap_dt_hive AND &today
+
+    );
+
+    disconnect from trino;
+quit;
