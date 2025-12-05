@@ -1,0 +1,1012 @@
+/*-----------------------------------------------------------------------------------------
+  SECTION 1: SETUP & CONNECTIONS
+-----------------------------------------------------------------------------------------*/
+/*sign-in script*/
+/*kinit -f PRYU0SRVWIN@MAPLE.FG.RBC.COM -t PRYU0SRVWIN_Prod.kt*/
+/*x 'cd; kinit -f PRYU0SRVWIN@MAPLE.FG.RBC.COM -t PRYU0SRVWIN_Prod.kt';*/
+
+/*for prod*/
+/*%let _server_ = uasasp11.fg.rbc.com 7551;*/
+/*options comamid=tcp remote=_server_ fullstimer;*/
+
+/*filename rlink "c:\Program Files\SASHome94\SASFoundation\9.4\connect\saslink\tcpunix.scr";*/
+/*signon rlink;*/
+
+/*libname rmtwork slibref=work server=_server_;*/
+
+/*rsubmit;*/
+x 'umask 000';
+options nosymbolgen;
+
+%global cdepath logpath outpath trackerpath logfile lstfile;
+%let cdepath = %sysfunc(ifc("&sysparm" = "", /sas/broc/cde, &sysparm));
+%include "&cdepath/common/security/pswd.sas";
+
+options sasautos = (sasautos, "&cdepath/common/macros/volatile", "&cdepath/common/macros/general");
+options pagesize = max;
+%let syscc = 0; /*System macro variable, */
+
+/* %macro ConnectSql; */
+/*  %local init_mprint init_symbolgen ;*/
+/*  --- Save initial options ---*/
+/*  %let init_mprint = %sysfunc(getoption(mprint)) ;*/
+/*  %let init_symbolgen = %sysfunc(getoption(symbolgen)) ;*/
+/*  %let tdpid_option = %sysfunc(ifc(&SYSHOSTNAME=uasast11,%str(tdpid=sdf),));*/
+/*  options nomprint nosymbolgen;*/
+/*  connect to teradata (user=&user password=&pswd mode=teradata connection=global database=&user &tdpid_option) ;*/
+/*  --- Reset options ---*/
+/*  options &init_mprint &init_symbolgen ;*/
+/* %mend ConnectSql; */
+
+x 'cd; kinit -f PRYU0SRVWIN@MAPLE.FG.RBC.COM -t PRYU0SRVWIN_Prod.kt';
+
+/*endrsubmit;*/
+
+/*rsubmit;*/
+
+%global env regpath logpath outpath sasfile logfile lstfile;
+%let env = PROD; /*Change to PROD when running production manually*/
+
+%let env = %sysfunc(
+    ifc("&env" = "",
+        %sysfunc(
+            ifc(%upcase(%substr(%sysget(USER),1,1)) = U and &SYSHOSTNAME ^= uasast11,
+                PROD,
+                DEV
+            )
+        ),
+        &env
+    )
+);
+
+%let regpath = %sysfunc(
+    ifc("&sysparm" ^+ "",
+        &sysparm,
+        %sysfunc(ifc(&env = PROD, /sas/RSD/REG, /sas/RSD/REG_DEV))
+    )
+);
+
+%include "&cdepath/common/security/pswd.sas";
+
+options sasautos = (sasautos,
+                    "&regpath/script/common/macros/volatile",
+                    "&regpath/script/common/macros/general");
+
+options pagesize = max;
+%let syscc = 0; /*System macro variable, */
+
+%let logpath = &regpath/C86/log/alert/dda;
+%let outpath = &regpath/C86/output/alert/dda;
+
+%let ymd     = %sysfunc(today(), yymmddn8.);
+%let logfile = &logpath/C86_Alert_DDA_&ymd..log;
+%let lstfile = &logpath/C86_Alert_DDA_&ymd..lst;
+
+%put &regpath &logfile &lstfile;
+%CreateDirectory(&logpath);
+
+proc printto log = "&logfile" print = "&lstfile" new;
+run;
+
+%GLOBAL _SASPROGRAMFILE;
+%let sasfile = %sysfunc(
+    ifc("&_SASPROGRAMFILE" = "",
+        %scan(&SYSPROCESSNAME,-1,%str( )),
+        %scan(&_SASPROGRAMFILE,-1,%str(/))
+    )
+);
+
+%put >>>>>>>>>> Name of This Program - &sasfile <<<<<<<<<<;
+%put >>>>>>>>>> Starting Running Time - %left(%sysfunc(datetime(), datetime20.)) <<<<<<<<<<;
+%put >>>>>>>>>> User ID - %sysget(USER) <<<<<<<<<<;
+%put >>>>>>>>>> Platform - &SYSHOSTNAME <<<<<<<<<<;
+%put >>>>>>>>>> Prod/Dev? - &env <<<<<<<<<<;
+
+libname alrtdata "&regpath./C86/output/alert/dda/";
+
+/*-----------------------------------------------------------------------------------------
+  SECTION 2: DATE & MACRO SETUP
+-----------------------------------------------------------------------------------------*/
+%let ini_run = 'I';
+
+%macro ini_check;
+    %if %sysfunc(fileexist(&outpath/dda_alert_ac_curr.sas7bdat)) %then %do;
+        %let ini_run = 'N';
+        x cp "&outpath/dda_alert_ac_curr.sas7bdat"
+             "&outpath/dda_alert_ac_curr_backup.sas7bdat";
+    %end;
+    %else %let ini_run = 'Y';
+%mend;
+
+%ini_check;
+%put &ini_run;
+
+data _null_;
+    tday2 = intnx('day',  today(), -0);
+    tday  = intnx('week.4', today(), -0);     /* Every Wednesday run */
+
+    launch_dt      = '30JUN2022'd;            /*need to change*/
+    ongoing_start  = max(intnx('day', tday, -180), launch_dt);
+
+    week_end = tday - 2;                      /* Ends on every Monday */
+
+    if &ini_run = 'N' then
+        week_start = week_end - 6;            /* Start on last Tuesday */
+    else week_start = launch_dt;
+
+    todayd = intnx('month', today(), 0, 'B') + 14; /*Change 0 to -1 for last month*/
+    medate = intnx('month', todayd, -1, 'E');
+    par_dt = week_start - 7;
+
+    call symput('snap_dt_hive',  "'" || put(week_start, yymmdd10.) || "'");
+    call symput('snap_dt_hive2', "'" || put(week_end,   yymmdd10.) || "'");
+    call symput('today',         "'" || put(tday,       yymmdd10.) || "'");
+    call symput('sasdt',         "'" || put(week_start, date.)     || "'d");
+    call symput('sasdt2',        "'" || put(week_end,   date.)     || "'d");
+    call symput('me_dt',         "'" || put(medate,     yymmdd10.) || "'");
+    call symput('ymd2',                 put(week_end,   yymmddn8.));
+    call symput('date_com',      "'" || put(tday2,      yymmdd10.) || "'");
+    call symput('pardt',         "'" || put(par_dt,     yymmdd10.) || "'");
+run;
+
+%put &=snap_dt_hive.;
+%put &=snap_dt_hive2.;
+%put &=today.;
+%put &=sasdt.;
+%put &=sasdt2.;
+%put &=me_dt.;
+%put &=ymd2.;
+%put &=date_com.;
+
+/*-----------------------------------------------------------------------------------------
+  SECTION 3: TRINO DATA EXTRACTION (REPLACES HIVE)
+-----------------------------------------------------------------------------------------*/
+/* NOTE:
+   - You MUST fill in real Trino connection options in each CONNECT TO TRINO block.
+   - Queries follow the working Trino pattern with json_parse/json_extract_scalar/try().
+*/
+
+/* Create Table PREF_INIT (initial load) */
+proc sql noprint;
+    connect to trino as sql1
+    (
+        /* TODO: replace with actual Trino connection options:
+           e.g. url='jdbc:trino://host:port?hive', user=&user, password=&pswd, etc.
+        */
+    );
+
+    create table pref_init as
+    select * from connection to sql1
+    (
+        WITH base AS (
+            SELECT
+                try(
+                    CAST(
+                        from_iso8601_timestamp(
+                            element_at(eventattributes, 'ess_process_timestamp')
+                        ) AS timestamp
+                    )
+                ) AS ess_process_timestamp_p,
+
+                try(
+                    CAST(
+                        from_iso8601_timestamp(
+                            element_at(eventattributes, 'ess_src_event_timestamp')
+                        ) AS timestamp
+                    )
+                ) AS ess_src_event_timestamp_p,
+
+                try(json_parse(element_at(eventattributes, 'SourceEventHeader'))) AS hdr,
+                try(json_parse(element_at(eventattributes, 'eventPayload')))      AS payload,
+
+                partition_date
+            FROM prod_brt0_ess.ffs0___client_alert_preferences_dep___initial_load
+            WHERE json_extract_scalar(payload, '$.preferenceType') = 'DDA_BALANCE_ALERT'
+              AND partition_date = DATE '2022-03-24'
+        )
+        SELECT
+            ess_process_timestamp_p,
+            ess_src_event_timestamp_p,
+
+            try(
+                CAST(
+                    from_iso8601_timestamp(
+                        json_extract_scalar(hdr, '$.eventTimestamp')
+                    ) AS timestamp
+                )
+            ) AS eventtimestamp_p,
+
+            json_extract_scalar(payload, '$.preferenceType') AS preferencetype_p,
+            json_extract_scalar(payload, '$.clientId')       AS clientid_p,
+            json_extract_scalar(payload, '$.sendAlertEligible') AS sendalerteligible_p,
+            json_extract_scalar(payload, '$.active')         AS active_p,
+            json_extract_scalar(payload, '$.threshold')      AS threshold_p,
+            json_extract_scalar(payload, '$.optOutDate')     AS optoutdate_p,
+            json_extract_scalar(payload, '$.account')        AS account,
+            json_extract_scalar(payload, '$.productType')    AS producttype_p
+        FROM base
+    );
+    disconnect from sql1;
+quit;
+
+/* Create Table PREF_NEW (ongoing preferences) */
+proc sql noprint;
+    connect to trino as sql1
+    (
+        /* TODO: Trino connection options */
+    );
+
+    create table pref_new as
+    select * from connection to sql1
+    (
+        WITH base AS (
+            SELECT
+                try(
+                    CAST(
+                        from_iso8601_timestamp(
+                            element_at(eventattributes, 'ess_process_timestamp')
+                        ) AS timestamp
+                    )
+                ) AS ess_process_timestamp_p,
+
+                try(
+                    CAST(
+                        from_iso8601_timestamp(
+                            element_at(eventattributes, 'ess_src_event_timestamp')
+                        ) AS timestamp
+                    )
+                ) AS ess_src_event_timestamp_p,
+
+                try(json_parse(element_at(eventattributes, 'SourceEventHeader'))) AS hdr,
+                try(json_parse(element_at(eventattributes, 'eventPayload')))      AS payload
+            FROM prod_brt0_ess.ffs0___client_alert_preferences_dep
+            WHERE json_extract_scalar(payload, '$.preferenceType') = 'DDA_BALANCE_ALERT'
+        )
+        SELECT
+            ess_process_timestamp_p,
+            ess_src_event_timestamp_p,
+
+            try(
+                CAST(
+                    from_iso8601_timestamp(
+                        json_extract_scalar(hdr, '$.eventTimestamp')
+                    ) AS timestamp
+                )
+            ) AS eventtimestamp_p,
+
+            json_extract_scalar(payload, '$.preferenceType') AS preferencetype_p,
+            json_extract_scalar(payload, '$.clientId')       AS clientid_p,
+            json_extract_scalar(payload, '$.sendAlertEligible') AS sendalerteligible_p,
+            json_extract_scalar(payload, '$.active')         AS active_p,
+            json_extract_scalar(payload, '$.threshold')      AS threshold_p,
+            json_extract_scalar(payload, '$.optOutDate')     AS optoutdate_p,
+            json_extract_scalar(payload, '$.accountId')      AS accountid,
+            json_extract_scalar(payload, '$.productType')    AS producttype_p
+        FROM base
+    );
+    disconnect from sql1;
+quit;
+
+/* Create Table COLT_START via Trino (replaces HIVE zgv0___colt_front_end_system) */
+proc sql noprint;
+    connect to trino as sql1
+    (
+        /* TODO: Trino connection options */
+    );
+
+    create table colt_start as
+    select * from connection to sql1
+    (
+        WITH base AS (
+            SELECT
+                try(
+                    CAST(
+                        from_iso8601_timestamp(
+                            element_at(eventattributes, 'ess_process_timestamp')
+                        ) AS timestamp
+                    )
+                ) AS ess_process_timestamp_c,
+
+                try(
+                    CAST(
+                        from_iso8601_timestamp(
+                            element_at(eventattributes, 'ess_src_event_timestamp')
+                        ) AS timestamp
+                    )
+                ) AS ess_src_event_timestamp_c,
+
+                try(json_parse(element_at(eventattributes, 'SourceEventHeader'))) AS hdr,
+                try(json_parse(element_at(eventattributes, 'eventPayload')))      AS payload,
+
+                partition_date
+            FROM prod_brt0_ess.zgv0___colt_front_end_system
+            WHERE partition_date > DATE &pardt.
+        )
+        SELECT
+            ess_process_timestamp_c,
+            ess_src_event_timestamp_c,
+
+            try(
+                CAST(
+                    from_iso8601_timestamp(
+                        json_extract_scalar(hdr, '$.eventTimestamp')
+                    ) AS timestamp
+                )
+            ) AS eventtimestamp_c,
+
+            json_extract_scalar(hdr, '$.eventActivityName') AS eventactivityname_c,
+
+            json_extract_scalar(payload, '$.alertType')   AS alerttype_c,
+            json_extract_scalar(payload, '$.clientId')    AS clientid_c,
+
+            try(CAST(json_extract_scalar(payload, '$.thresholdAmount') AS double))
+                AS thresholdamount_c,
+
+            try(
+                CAST(
+                    from_iso8601_timestamp(
+                        json_extract_scalar(payload, '$.transactionTimestamp')
+                    ) AS timestamp
+                )
+            ) AS transactiontimestamp_c,
+
+            try(CAST(json_extract_scalar(payload, '$.alertAmount') AS double))
+                AS alertamount_c,
+            try(CAST(json_extract_scalar(payload, '$.previousBalance') AS double))
+                AS previousbalance_c,
+
+            json_extract_scalar(payload, '$.accountStatus')    AS accountstatus_c,
+            json_extract_scalar(payload, '$.accountId')        AS accountid,
+            json_extract_scalar(payload, '$.processingCentre') AS processingcentre_c,
+            json_extract_scalar(payload, '$.accountCloseInd')  AS accountcloseind_c,
+            json_extract_scalar(payload, '$.decisionId')       AS decisionid,
+            json_extract_scalar(payload, '$.reasonCodes')      AS reasoncodes_c
+
+        FROM base
+        WHERE json_extract_scalar(payload, '$.alertType') = 'DDA_BALANCE_ALERT'
+          AND date(
+                  try(
+                      CAST(
+                          from_iso8601_timestamp(
+                              json_extract_scalar(payload, '$.transactionTimestamp')
+                          ) AS timestamp
+                      )
+                  )
+              ) BETWEEN DATE &snap_dt_hive.
+                    AND DATE &today.
+    );
+    disconnect from sql1;
+quit;
+
+/* Create Table ALERT_INBOX via Trino (replaces HIVE fft0___alert_inbox_dep) */
+proc sql noprint;
+    connect to trino as sql1
+    (
+        /* TODO: Trino connection options */
+    );
+
+    create table alert_inbox as
+    select * from connection to sql1
+    (
+        WITH base AS (
+            SELECT
+                try(
+                    CAST(
+                        from_iso8601_timestamp(
+                            element_at(eventattributes, 'ess_process_timestamp')
+                        ) AS timestamp
+                    )
+                ) AS ess_process_timestamp_a,
+
+                try(
+                    CAST(
+                        from_iso8601_timestamp(
+                            element_at(eventattributes, 'ess_src_event_timestamp')
+                        ) AS timestamp
+                    )
+                ) AS ess_src_event_timestamp_a,
+
+                try(json_parse(element_at(eventattributes, 'SourceEventHeader'))) AS hdr,
+                try(json_parse(element_at(eventattributes, 'eventPayload')))      AS payload,
+
+                partition_date
+            FROM prod_brt0_ess.fft0___alert_inbox_dep
+            WHERE partition_date > DATE &pardt.
+              AND json_extract_scalar(payload, '$.alertType') = 'DDA_BALANCE_ALERT'
+        )
+        SELECT
+            ess_process_timestamp_a,
+            ess_src_event_timestamp_a,
+
+            try(
+                CAST(
+                    from_iso8601_timestamp(
+                        json_extract_scalar(hdr, '$.eventTimestamp')
+                    ) AS timestamp
+                )
+            ) AS eventtimestamp_a,
+
+            json_extract_scalar(payload, '$.alertType')      AS alerttype_a,
+            json_extract_scalar(payload, '$.decisionId')     AS decisionid,
+            json_extract_scalar(payload, '$.accountId')      AS accountid,
+            json_extract_scalar(payload, '$.alertAmount')    AS alertamount_a,
+            json_extract_scalar(payload, '$.thresholdAmount') AS thresholdamount_a,
+            json_extract_scalar(payload, '$.alertSent')      AS alertsent_a,
+            json_extract_scalar(payload, '$.reasonCode')     AS reasoncode_a
+        FROM base
+        WHERE date(ess_src_event_timestamp_a) >= DATE &snap_dt_hive.
+    );
+    disconnect from sql1;
+quit;
+
+/*-----------------------------------------------------------------------------------------
+  SECTION 4: TERADATA PULLS & PREP  (UNCHANGED)
+-----------------------------------------------------------------------------------------*/
+data pref_new2 (drop = accountID);
+    set pref_new;
+    account = substr(accountId, 6, 7);
+run;
+
+data pref;
+    set pref_init
+        pref_new2;
+run;
+
+proc sql;
+    %ConnectSql
+    create table Calendar as
+    select * from connection to teradata
+    (
+        select distinct
+            holidy_dt          as DATE_T,
+            holidy_dt + 1      as DATE_T2,
+            Holidy_TYP,
+            subcntry_cd,
+            cntry_Cd,
+            snap_dt
+        from ddwv01.HOLIDY
+        where SNAP_DT = &me_dt.
+          and (holidy_typ = 'F'
+               or (holidy_typ = 'P' and subcntry_cd = 'ON')
+               or (holidy_typ = 'P' and subcntry_cd = 'QC'))
+          and DATE_T between '2021-11-01' and date
+        order by 1
+    );
+    disconnect from teradata;
+quit;
+
+data calendar1 (rename = (date_t = transaction_date));
+    set Calendar (keep = DATE_T);
+run;
+
+data calendar2 (rename = (date_t2 = transaction_date));
+    set Calendar (keep = DATE_T2);
+run;
+
+data holiday;
+    set calendar1
+        calendar2;
+run;
+
+proc sort data = holiday;
+    by transaction_date;
+run;
+
+/*-----------------------------------------------------------------------------------------
+  SECTION 5: COLT PROCESSING & SAMPLING  (UNCHANGED)
+-----------------------------------------------------------------------------------------*/
+data colt2;
+    set colt_start; /* note: source is colt_start from Trino now */
+    transaction_date = transactiontimestamp_c2;
+    if transaction_date >= &sasdt.
+       and transaction_date <= &sasdt2.;
+run;
+
+proc sort data = colt2;
+    by transaction_date;
+run;
+
+data colt3;
+    merge colt2  (in = inbase)
+          holiday (in = inholi);
+    by transaction_date;
+    if inbase;
+    newdate = intnx('week.2', transaction_date, 1);
+    if weekday(transaction_date) = 2 then newdate = transaction_date;
+run;
+
+/*Sort by descending transaction time within the client, account and date*/
+proc sort data = colt3 out = colt4;
+    by clientid_c accountid transaction_date descending transactiontimestamp_c;
+run;
+
+/*Only keep the final alert creating transaction of the day*/
+proc sort data = colt4 nodupkey;
+    by clientid_c accountid transaction_date;
+run;
+
+/*Sort by transaction date for purpose of strata - need 10 per day*/
+proc sort data = colt4;
+    by transaction_date;
+run;
+
+%macro sample_dda(indata, outdata);
+
+/*Ensure sample size is set to correct value if there are less than 10 records */
+proc sql noprint;
+    select count(decisionid) into :size
+    from &indata.;
+quit;
+%let size = &size;
+%put &size.;
+
+%let samp_size = %sysfunc(min(&size., 10));
+%put &samp_size.;
+
+%if &samp_size. > 0 %then %do;
+
+    /*sample clients */
+    data version2;
+        set &indata.;
+        where transaction_date ne .;
+    run;
+
+    proc surveyselect data = version2
+        out      = &outdata.
+        method   = srs
+        sampsize = &samp_size.
+        strata   transaction_date;
+    run;
+%end;
+
+/* if no samples exist, the matches and unused files still need to get created
+   for the total population table */
+%if &samp_size. <= 0 %then %do;
+    data &outdata.;
+        set &indata.;
+    run;
+%end;
+
+%mend sample_dda;
+
+%sample_dda(colt4, dda_colt);
+
+data dda_colt;
+    set dda_colt;
+    format ar_id $20.;
+    ar_id = '00000000' || accountid;
+run;
+
+/*Create listing of arrangements to be queried in EDW*/
+proc sql;
+    select "'" || ar_id || "'" into :dda_alert_list separated by ','
+    from dda_colt;
+quit;
+%put &=dda_alert_list;
+
+/*Create listing of clients to be queried in EDW*/
+proc sql;
+    select clientId_c into :dda_alert_list_clnt separated by ','
+    from dda_colt;
+quit;
+%put &=dda_alert_list_clnt;
+
+/*-----------------------------------------------------------------------------------------
+  SECTION 6: MERGING WITH INBOX & PREFERENCES  (UNCHANGED)
+-----------------------------------------------------------------------------------------*/
+proc sort data = dda_colt;
+    by decisionId;
+run;
+
+proc sort data = alert_inbox;
+    by decisionId;
+run;
+
+data dda_colt_inbox;
+    merge dda_colt (in = inbase)
+          alert_inbox;
+    by decisionid;
+    if inbase;
+    account = substr(accountId, 6, 7);
+run;
+
+/*combine data with preference data (last record before transaction event)*/
+proc sql;
+    create table pref_sum as
+    select
+        colt.account,
+        colt.clientid_c,
+        colt.alertType_c,
+        colt.transactionTimestamp_c,
+        max(pref.ess_src_event_timestamp_p) as pref_time format = dateampm22.2
+    from dda_colt_inbox as colt
+    left join pref as pref
+      on colt.account        = pref.account
+     and colt.clientid_c     = pref.clientid_p
+     and colt.alertType_c    = pref.preferencetype_p
+     and colt.transactionTimestamp_c >= pref.ess_src_event_timestamp_p
+    where alertType_c = 'DDA_BALANCE_ALERT'
+    group by 1,2,3,4;
+quit;
+
+proc sql;
+    create table dda_total_hive_1 as
+    select
+        dda_colt_inbox.ess_process_timestamp_c,
+        dda_colt_inbox.ess_src_event_timestamp_c,
+        dda_colt_inbox.eventactivityname_c,
+        dda_colt_inbox.alerttype_c,
+        dda_colt_inbox.clientid_c,
+        dda_colt_inbox.thresholdamount_c,
+        dda_colt_inbox.transactiontimestamp_c,
+        dda_colt_inbox.transactiontimestamp_c2,
+        dda_colt_inbox.transaction_date,
+        dda_colt_inbox.alertamount_c,
+        dda_colt_inbox.previousbalance_c,
+        dda_colt_inbox.accountstatus_c,
+        dda_colt_inbox.accountid,
+        dda_colt_inbox.processingcentre_c,
+        dda_colt_inbox.accountcloseind_c,
+        dda_colt_inbox.decisionid,
+        dda_colt_inbox.reasoncodes_c,
+        dda_colt_inbox.ar_id,
+        dda_colt_inbox.ess_src_event_timestamp_a,
+        dda_colt_inbox.eventtimestamp_a,
+        dda_colt_inbox.alerttype_a,
+        dda_colt_inbox.alertsent_a,
+        dda_colt_inbox.reasoncode_a,
+        prop_pref.ess_process_timestamp_p,
+        prop_pref.ess_src_event_timestamp_p,
+        prop_pref.eventtimestamp_p,
+        prop_pref.preferencetype_p,
+        prop_pref.clientid_p,
+        prop_pref.sendalerteligible_p,
+        prop_pref.active_p,
+        prop_pref.threshold_p,
+        prop_pref.optoutdate_p,
+        prop_pref.producttype_p
+    from dda_colt_inbox as dda_colt_inbox
+    left join
+    (
+        select
+            pref_total.*,
+            pref_sum.transactionTimestamp_c
+        from pref as pref_total,
+             pref_sum
+        where pref_total.account            = pref_sum.account
+          and pref_total.clientid_p        = pref_sum.clientid_c
+          and pref_total.preferencetype_p  = pref_sum.alertType_c
+          and pref_total.ess_src_event_timestamp_p = pref_sum.pref_time
+    ) as prop_pref
+      on dda_colt_inbox.account            = prop_pref.account
+     and dda_colt_inbox.clientid_c         = prop_pref.clientid_p
+     and dda_colt_inbox.alertType_c        = prop_pref.preferencetype_p
+     and dda_colt_inbox.transactionTimestamp_c = prop_pref.transactionTimestamp_c
+    ;
+quit;
+
+proc sort data = dda_total_hive_1 nodup;
+    by clientid_c ar_id;
+run;
+
+data dda_total_hive;
+    set dda_total_hive_1;
+    format clnt_no 9.;
+    clnt_no = clientid_c;
+run;
+
+/*timeliness and completeness logic*/
+proc sort data = alert_inbox;
+    by decisionid ess_process_timestamp_a;
+run;
+
+/*If a dup exists, take the one with the earlier processing timestamp*/
+proc sort data = alert_inbox dupout = alert_dup nodupkey;
+    by decisionid;
+run;
+
+/*timeliness and completeness logic*/
+proc sort data = colt_start;
+    by decisionid ess_process_timestamp_c;
+run;
+
+/*If a dup exists, take the one with the earlier processing timestamp*/
+proc sort data = colt_start dupout = colt_dup nodupkey;
+    by decisionid;
+run;
+
+data colt_decisioned;
+    set colt_start;
+    transaction_date = transactiontimestamp_c2;
+    if transaction_date <= &sasdt2.;
+    if transaction_date >= &sasdt.;
+    if eventactivityname_c = 'AlertDecision';
+run;
+
+proc sort data = colt_decisioned;
+    by decisionid;
+run;
+
+proc sql;
+    create table alert_inbox_utc as
+    select
+        alert_inbox.*,
+        case
+            when colt_decisioned.processingCentre_c = 'B' then
+                datepart(tzoneu2s(alert_inbox.ess_src_event_timestamp_a,
+                                  'America/Vancouver'))
+            else
+                datepart(tzoneu2s(alert_inbox.ess_src_event_timestamp_a,
+                                  'America/Toronto'))
+        end as ess_src_event_timestamp_a2 format date9.
+    from alert_inbox as alert_inbox
+    left join colt_decisioned as colt_decisioned
+      on colt_decisioned.decisionid = alert_inbox.decisionid
+    ;
+quit;
+
+/*-----------------------------------------------------------------------------------------
+  SECTION 7: TIMELINESS & LOGIC  (UNCHANGED)
+-----------------------------------------------------------------------------------------*/
+data inboth_met_time
+     inboth_did_not_meet_time
+     incolt_only
+     inbox_only
+     transaction_utc_issue
+     alert_inbox_buffer
+     remaining_inbox;
+    merge alert_inbox_utc (in = inbox)
+          colt_decisioned (in = incolt);
+    by decisionid;
+
+    RegulatoryName = 'C86';
+    LOB            = 'Payments & Banking';
+    ReportName     = 'C86 Alerts';
+    ProductType    = 'Personal Deposit Accounts';
+
+    newdate = intnx('week.2', transaction_date, 1);
+    if weekday(transaction_date) = 2 then newdate = transaction_date;
+
+    timecheck      = intck("second", transactiontimestamp_c,
+                           ess_src_event_timestamp_a);
+    ess_src_event_a = datepart(ess_src_event_timestamp_a);
+
+    if inbox and incolt then do;
+        if timecheck <= 1800 then output inboth_met_time;
+        else output inboth_did_not_meet_time;
+    end;
+
+    if not inbox and incolt then output incolt_only;
+
+    if inbox and not incolt
+       and ess_src_event_timestamp_a2 <= &sasdt2.
+       and ess_src_event_timestamp_a2 > &sasdt. then output inbox_only;
+    else if inbox and not incolt
+            and ess_src_event_timestamp_a2 <= &sasdt. then output transaction_utc_issue;
+    else if inbox and not incolt
+            and ess_src_event_timestamp_a2 > &sasdt2. then output alert_inbox_buffer;
+    else if inbox and not incolt then output remaining_inbox;
+run;
+
+data alrtdata.inbox_only_&ymd2.;
+    set inbox_only;
+run;
+
+data total_timeliness;
+    set inboth_met_time          (in = intime)
+        inboth_did_not_meet_time (in = notime)
+        incolt_only              (in = inmiss);
+    ControlRisk = 'Timeliness';
+    format transaction_date date9.;
+    transaction_date = transactiontimestamp_c2;
+    alertamount      = input(alertamount_c,   comma9.);
+    thresholdamount  = input(thresholdamount_c, comma9.);
+    if intime then do;
+        CommentCode = 'COM16';
+        Comments    = 'Pass';
+    end;
+    if notime then do;
+        CommentCode = 'COM19';
+        Comments    = 'Potential Fail';
+    end;
+    if inmiss then do;
+        CommentCode = 'COM19';
+        Comments    = 'Potential Fail';
+    end;
+run;
+
+proc sql;
+    create table ac_time_dda_alert as 
+    select
+        RegulatoryName,
+        LOB,
+        ReportName,
+        ControlRisk,
+        'Anomaly'                         as TestType,
+        'Portfolio'                       as TestPeriod,
+        ProductType,
+        'Alert002_Timeliness_SLA'         as RDE,
+        ''                                as SubDE,
+        ''                                as Segment,
+        /* ... Segments 2-9 empty ... */
+        put(transaction_date, yymmn6.)    as segment10 length = 50,
+        'N'                               as HoldoutFlag,
+        CommentCode,
+        Comments,
+        count(accountId)                  as Volume,
+        sum(alertamount)                  as Bal,
+        sum(thresholdamount)             as Amount,
+        input(&date_com., yymmdd10.)      as DateCompleted format = yymmdd10.,
+        newdate                           as SnapDate     format = yymmdd10.
+    from total_timeliness
+    where transaction_date ne .
+    group by 1,2,3,4,5,6,7,8,9,10,
+             11,12,13,14,15,16,17,18,19,20,21,22,26,27
+    order by 1,2,27
+    ;
+quit;
+
+data total_completeness;
+    set inboth_met_time          (in = intime)
+        inboth_did_not_meet_time (in = notime)
+        incolt_only              (in = inmiss);
+    ControlRisk = 'Completeness';
+    format transaction_date date9.;
+    transaction_date = transactiontimestamp_c2;
+    alertamount      = input(alertamount_c,   comma9.);
+    thresholdamount  = input(thresholdamount_c, comma9.);
+    if intime then do;
+        CommentCode = 'COM16';
+        Comments    = 'Pass';
+    end;
+    if notime then do;
+        CommentCode = 'COM16';
+        Comments    = 'Pass';
+    end;
+    if inmiss then do;
+        CommentCode = 'COM19';
+        Comments    = 'Potential Fail';
+    end;
+run;
+
+proc sql;
+    create table ac_comp_dda_alert as
+    select
+        RegulatoryName,
+        LOB,
+        ReportName,
+        ControlRisk,
+        'Reconciliation'                  as TestType,
+        'Portfolio'                       as TestPeriod,
+        ProductType,
+        'Alert003_Completeness_All_Clients' as RDE,
+        ''                                as SubDE,
+        ''                                as Segment,
+        /* ... Segments 2-9 empty ... */
+        put(transaction_date, yymmn6.)    as segment10 length = 50,
+        'N'                               as HoldoutFlag,
+        CommentCode,
+        Comments,
+        count(accountId)                  as Volume,
+        sum(alertamount)                  as Bal,
+        sum(thresholdamount)             as Amount,
+        input(&date_com., yymmdd10.)      as DateCompleted format = yymmdd10.,
+        newdate                           as SnapDate     format = yymmdd10.
+    from total_completeness
+    where transaction_date ne .
+    group by 1,2,3,4,5,6,7,8,9,10,
+             11,12,13,14,15,16,17,18,19,20,21,22,26,27
+    order by 1,2,27
+    ;
+quit;
+
+/*-----------------------------------------------------------------------------------------
+  SECTION 8: MACRO DDA_WEEK & TERADATA LOOPS  (UNCHANGED)
+-----------------------------------------------------------------------------------------*/
+options sasautos = ("&cdepath/common/macros/general");
+
+%macro dda_week(n);
+
+data _null_;
+    tday     = intnx('week.4', today(), -0); /* Every Wednesday run */
+    week_end = tday - 2;                    /* Ends on every Monday */
+    RELTN_DLY = intnx('day', week_end, -&n., 'B');
+    call symput('snap_dt', "'" || put(RELTN_DLY, yymmdd10.) || "'");
+run;
+%put &=snap_dt.;
+
+proc sql;
+    %connectsql
+    create table pers_pda_population_&n. as
+    select * from connection to teradata
+    (
+        select CLNT_AR_RELTN_DLY.clnt_no,
+               CLNT_AR_RELTN_DLY.PRMRY_CLNT_IND,
+               CLNT_AR_RELTN_DLY.CLNT_AR_RELTN_TYP,
+               CLNT_AR_RELTN_DLY.CLNT_TYP,
+               AR_STATIC_DLY.AR_ID,
+               AR_STATIC_DLY.SRVC_ID,
+               AR_STATIC_DLY.SNAP_DT,
+               AR_STATIC_DLY.CAPTR_DT,
+               AR_STATIC_DLY.SPCFC_FND_IND,
+               AR_STATIC_DLY.ACCT_NO,
+               AR_STATIC_DLY.OPEN_CLS_STS,
+               AR_STATIC_DLY.DT_OPEN,
+               AR_STATIC_DLY.DT_CLS,
+               AR_STATIC_DLY.CURR_CD,
+               AR_STATIC_DLY.SHRT_NM,
+               AR_STATIC_DLY.CHG_DT,
+               AR_STATIC_DLY.LST_UPDT_DT_TM,
+               AR_STATIC_DLY.ACCT_CATG_CD,
+               AR_STATIC_DLY.ACCT_TYP,
+               AR_STATIC_DLY.ACCT_CLS,
+               DEPOSIT_ACCOUNT_DLY.RESTRAINT_DATE,
+               DEPOSIT_ACCOUNT_DLY.RESTRAINT_OVRRD_DT,
+               DEPOSIT_ACCOUNT_DLY.RESTRNT_TYP_R_SPCL,
+               DEPOSIT_ACCOUNT_DLY.DEP_ACCT_STS,
+               DEPOSIT_ACCOUNT_DLY.MSG_CD1,
+               DEPOSIT_ACCOUNT_DLY.MSG_CD2,
+               DEPOSIT_ACCOUNT_DLY.MSG_CD3,
+               DEPOSIT_ACCOUNT_DLY.MSG_CD4,
+               DEPOSIT_ACCOUNT_DLY.MSG_CD5,
+               AR_BAL_DLY.BAL,
+               AR_BAL_DLY2.BAL as bal_yesterday,
+
+               case when DEPOSIT_ACCOUNT_DLY.DEP_ACCT_STS between 0 and 6
+                    then 'Valid Status   '
+                    else 'Invalid Status'
+               end as acct_status,
+
+               case when CLNT_AR_RELTN_DLY.CLNT_AR_RELTN_TYP in (4,5,6)
+                    then 'Invalid Relationship type'
+                    else 'Valid Relationship type'
+               end as Relationship_type,
+
+               case when DEPOSIT_ACCOUNT_DLY.MSG_CD1 in (51,65) or
+                         DEPOSIT_ACCOUNT_DLY.MSG_CD2 in (51,65) or
+                         DEPOSIT_ACCOUNT_DLY.MSG_CD3 in (51,65) or
+                         DEPOSIT_ACCOUNT_DLY.MSG_CD4 in (51,65) or
+                         DEPOSIT_ACCOUNT_DLY.MSG_CD5 in (51,65)
+                    then 'Invalid - deceased/closed restraint'
+                    else 'Valid - non-deceased/non-closed'
+               end as deceased_closed_status
+
+        from DDWV01.CLNT_AR_RELTN_DLY      as CLNT_AR_RELTN_DLY
+        inner join DDWV01.AR_STATIC_DLY    as AR_STATIC_DLY
+            on CLNT_AR_RELTN_DLY.ar_id    = AR_STATIC_DLY.ar_id
+           and CLNT_AR_RELTN_DLY.snap_dt  = &snap_dt.
+           and CLNT_AR_RELTN_DLY.snap_dt  = AR_STATIC_DLY.snap_dt
+        left join DDWV01.DEPOSIT_ACCOUNT_DLY as DEPOSIT_ACCOUNT_DLY
+            on CLNT_AR_RELTN_DLY.ar_id    = DEPOSIT_ACCOUNT_DLY.ar_id
+           and DEPOSIT_ACCOUNT_DLY.snap_dt = &snap_dt.
+        left join DDWV01.AR_BAL_DLY       as AR_BAL_DLY
+            on CLNT_AR_RELTN_DLY.ar_id    = AR_BAL_DLY.ar_id
+           and AR_BAL_DLY.snap_dt         = &snap_dt.
+        left join
+        (
+            select
+                AR_BAL_DLY_pre1.ar_id,
+                AR_BAL_DLY_pre1.bal
+            from DDWV01.AR_BAL_DLY as AR_BAL_DLY_pre1
+            inner join
+            (
+                select
+                    AR_BAL_DLY_inner.ar_id,
+                    max(AR_BAL_DLY_inner.snap_dt) as max_snap
+                from DDWV01.AR_BAL_DLY as AR_BAL_DLY_inner
+                where AR_BAL_DLY_inner.snap_dt < &snap_dt.
+                  and AR_BAL_DLY_inner.ar_id in (&dda_alert_list.)
+                group by 1
+            ) as AR_BAL_DLY_pre2
+              on AR_BAL_DLY_pre1.ar_id   = AR_BAL_DLY_pre2.ar_id
+             and AR_BAL_DLY_pre1.snap_dt = AR_BAL_DLY_pre2.max_snap
+        ) as AR_BAL_DLY2
+          on CLNT_AR_RELTN_DLY.ar_id = AR_BAL_DLY2.ar_id
+
+        where CLNT_AR_RELTN_DLY.ar_id   in (&dda_alert_list.)
+          and CLNT_AR_RELTN_DLY.clnt_no in (&dda_alert_list_clnt.)
+    );
+    disconnect from teradata;
+quit;
+
+%mend dda_week;
