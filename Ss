@@ -1,3 +1,119 @@
+data _null_;
+    /* Calculate key dates */
+    tday2 = intnx('day', today(), -0);
+    tday  = intnx('week.4', today(), -0);     /* Wednesday weekly run */
+    launch_dt   = '30JUN2022'd;
+    ongoing_start = max(intnx('day', tday, -180), launch_dt);
+
+    week_end = tday - 2;                      /* Monday */
+    if &ini_run = 'N' then
+        week_start = week_end - 6;            /* Tuesday */
+    else
+        week_start = launch_dt;
+
+    todayd = intnx('month', today(), 0, 'B') + 14;
+    medate = intnx('month', todayd, -1, 'E');
+    par_dt = week_start - 7;
+
+    /* -------- FORMAT MACRO VARIABLES FOR TRINO -------- */
+
+    /* TIMESTAMP START (00:00:00) */
+    call symput('snap_dt_hive',
+        "TIMESTAMP '" || put(week_start, yymmdd10.) || " 00:00:00'"
+    );
+
+    /* TIMESTAMP END (23:59:59) */
+    call symput('snap_dt_hive2',
+        "TIMESTAMP '" || put(week_end, yymmdd10.) || " 23:59:59'"
+    );
+
+    /* TODAY TIMESTAMP END */
+    call symput('today',
+        "TIMESTAMP '" || put(tday, yymmdd10.) || " 23:59:59'"
+    );
+
+    /* DATE literal for partition_date comparison */
+    call symput('pardt',
+        "'" || put(par_dt, yymmdd10.) || "'"
+    );
+run;
+
+proc sql noprint;
+    CONNECT TO JDBC AS trino (
+        CLASSPATH="/sas/tpa/jdbc/trinojdbc.jar"
+        DRIVERCLASS="io.trino.jdbc.TrinoDriver"
+        USER="PRYU0SRVWIN"
+        PASSWORD="sM0c3Mx66CBQs46"
+        URL="jdbc:trino://strplvaexh0001.fg.rbc.com:8443/edl0_im/prod_brt0_ess/?&SSL=true"
+    );
+
+    create table work.colt_start1 as
+    select * from connection to trino (
+
+        WITH raw AS (
+            SELECT
+                eventattributes,
+                partition_date
+            FROM prod_brt0_ess.zgv0___colt_front_end_system
+            WHERE partition_date > DATE &pardt
+              AND CAST(element_at(eventattributes,'eventPayload') AS varchar)
+                    LIKE '%DDA_BALANCE_ALERT%'
+        ),
+
+        base AS (
+            SELECT
+                try(json_parse(element_at(eventattributes,'eventPayload')))   AS payload,
+                try(json_parse(element_at(eventattributes,'SourceEventHeader'))) AS hdr,
+                try(CAST(from_iso8601_timestamp(
+                    element_at(eventattributes,'ess_process_timestamp')
+                ) AS timestamp)) AS ess_process_timestamp_c,
+                try(CAST(from_iso8601_timestamp(
+                    element_at(eventattributes,'ess_src_event_timestamp')
+                ) AS timestamp)) AS ess_src_event_timestamp_c,
+                partition_date
+            FROM raw
+        )
+
+        SELECT
+            ess_process_timestamp_c,
+            ess_src_event_timestamp_c,
+            try(
+                CAST(
+                    from_iso8601_timestamp(
+                        json_extract_scalar(payload,'$.transactionTimestamp')
+                    ) AS timestamp
+                )
+            ) AS eventtimestamp_c,
+            json_extract_scalar(hdr,'$.eventActivityName') AS eventactivityname_c,
+            json_extract_scalar(payload,'$.alertType')     AS alerttype_c,
+            json_extract_scalar(payload,'$.clientId')      AS clientid_c,
+            json_extract_scalar(payload,'$.accountId')     AS accountid_c,
+            try(CAST(json_extract_scalar(payload,'$.thresholdAmount') AS double)) AS thresholdamount_c,
+            try(CAST(json_extract_scalar(payload,'$.alertAmount') AS double))       AS alertamount_c,
+            try(CAST(json_extract_scalar(payload,'$.previousBalance') AS double))   AS previousbalance_c,
+            json_extract_scalar(payload,'$.accountStatus') AS accountstatus_c,
+            json_extract_scalar(payload,'$.processingCentre') AS processingcentre_c,
+            json_extract_scalar(payload,'$.accountcloseInd') AS accountcloseind_c,
+            json_extract_scalar(payload,'$.decisionId') AS decisionid,
+            json_extract_scalar(payload,'$.reasonCodes') AS reasoncodes_c
+        FROM base
+
+        WHERE json_extract_scalar(payload,'$.alertType') = 'DDA_BALANCE_ALERT'
+
+          AND try(
+                CAST(
+                    from_iso8601_timestamp(
+                        json_extract_scalar(payload,'$.transactionTimestamp')
+                    ) AS timestamp
+                )
+              ) BETWEEN &snap_dt_hive AND &today
+
+    );
+
+    disconnect from trino;
+quit;
+
+
 call symput('snap_dt_hive',
     "TIMESTAMP '" || put(week_start, yymmdd10.) || " 00:00:00'"
 );
