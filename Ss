@@ -1,3 +1,14 @@
+WHERE partition_date > DATE &pardt
+
+AND try(
+      CAST(
+          from_iso8601_timestamp(
+              json_extract_scalar(payload,'$.transactionTimestamp')
+          ) AS timestamp
+      )
+    ) BETWEEN &snap_dt_hive AND &today
+
+
 data _null_;
     /* Calculate key dates */
     tday2 = intnx('day', today(), -0);
